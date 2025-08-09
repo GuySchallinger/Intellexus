@@ -1,0 +1,178 @@
+"""
+Utils for the Meter Classification task.
+Meter Classification is a task classifying a verse's meter based on its text.
+Meter = the rhythmic structure of a verse, determined by the arrangement of stressed and unstressed syllables.
+Labels:
+"""
+
+# Imports
+import os
+import re
+import pandas as pd
+import random
+
+from langchain_core.prompts import ChatPromptTemplate, FewShotChatMessagePromptTemplate
+
+from utils.utils import FEW_SHOT_PROMPT_TEMPLATE, process_responses_classification, process_responses_extraction
+
+###############################################################################
+# Constants
+# create labels for  ['anuṣṭubh_pathyā', 'anuṣṭubh_vipulā', 'āryā', 'drutavilambita', 'mandākrāntā', 'sragdharā', 'śālinī', 'śārdūlavikrīḍita','upajāti_family', 'vasantatilakā' "EMPTY"]
+LABEL2ID = {'L0': 0, 'L1': 1, 'L2': 2, 'L3': 3, 'L4': 4, 'L5': 5, 'L6': 6, 'L7': 7, 'L8': 8, 'L9': 9, "EMPTY": -1}
+# LABEL2ID = {'anuṣṭubh_pathyā': 0, 'anuṣṭubh_vipulā': 1, 'āryā': 2, 'drutavilambita': 3, 'mandākrāntā': 4, 'sragdharā': 5, 'śālinī': 6, 'śārdūlavikrīḍita': 7, 'upajāti_family': 8, 'vasantatilakā': 9, "EMPTY": -1}
+
+LABELS = list(LABEL2ID.keys())
+
+# Get parent parent_dir
+parent_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+#TODO: change to your task data directory
+#DATA_DIR = os.path.join(parent_dir, "data")
+FILE_NAME = "meters_with_labels.csv"
+
+
+# Columns to be logged together with the model's raw responses
+#TODO: change to your task columns that will be logged with the model's raw responses
+# LOG_COLUMNS = ["sentiment", "text"]
+LOG_COLUMNS = ["text", "label"]
+
+###############################################################################
+PROMPTS = {
+"system": """
+You are a professional prosodist specializing in Sanskrit chandas (metrical analysis) and your task is to classify the metrical pattern of a given Sanskrit verse written in Sanskrit.
+This is a definition of Sanskrit meter: 'The rhythmic structure of Sanskrit verse, determined by the pattern of guru (heavy/long) and laghu (light/short) syllables, following traditional chandas patterns'.
+Analyze the syllable quantities (guru-laghu patterns) and classify the verse into one of these specific chandas labels:
+"L0": "anuṣṭubh_pathyā", 32-syllable meter, standard anuṣṭubh with regular patterns in all quarters.
+"L1": "anuṣṭubh_vipulā", 32-syllable meter, irregular anuṣṭubh with unusual syllable patterns in odd quarters.
+"L2": "āryā", Arya meter (12+18+12+15 mātrās) - Quantitative meter, characteristic cadence
+"L3": "drutavilambita", Drutavilambita meter (12 syllables per quarter = 48 total)
+"L4": "mandākrāntā", Mandakranta meter (17 syllables per quarter = 68 total)
+"L5": "sragdharā", Sragdhara meter (21 syllables per quarter = 84 total)
+"L6": "śālinī", Shalini meter (11 syllables per quarter = 44 total)
+"L7": "śārdūlavikrīḍita", Shardulavikridita meter (19 syllables per quarter = 76 total)
+"L8": "upajāti_family", 44-syllable meter, verses with 11 syllables per quarter (not 8).
+"L9": "vasantatilakā", 56-syllable meter, verses with 14 syllables per quarter (longest common meter).
+
+IMPORTANT: You must use ONLY the exact index numbers above. Do not use label names or create variations.
+Consider the pada (quarter-verse) structure and analyze the guru-laghu patterns carefully.
+You are given one Sanskrit verse, you are an expert in Sanskrit prosody and chandas classification.
+
+CRITICAL RESPONSE FORMAT:
+- Do NOT provide any reasoning, explanation, or analysis
+- Do NOT include any text before or after the JSON
+- Return ONLY this exact format: {{"label": "INDEX_NUMBER"}}
+- Replace INDEX_NUMBER with the corresponding index (L0, L1, L2, L3, L4, L5, L6, L7, L8, L9)
+- No additional fields, no explanations, no other content
+- Do not make any calculations, the numbers are just indexes! 
+
+Example response: {{"label": "L1"}}
+Only respond with the JSON output, do not include additional text or explanations.
+""",
+"user": "Verse:{verse}\n",
+}
+
+###############################################################################
+# Functions
+
+"""
+If there is one input text, name it 'text' in the dataframe.
+If it's a classification task, df should contain 'label' column with the labels as strings.
+If it's an extraction task, df should contain 'ground_truth' column with a list as follows:
+---------- [("PER", "John Doe"), ("LOC", "New York")...] ----------
+"""
+def get_data(data_dir, **kwargs) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Get data for the given task.
+    :param kwargs: keyword arguments
+    :return: train if exists, test data, both as dataframes
+    """
+
+    # Get data
+    # read the csv file from DATA_DIR
+    file_name=FILE_NAME
+    datasets_folder = os.path.join(data_dir, "skt_meters_classification/testset")
+    df = pd.read_csv(os.path.join(datasets_folder, file_name))
+
+
+    # verify there are columns 'text' and 'label', if their sentiment changes it to label
+    if "text" not in df.columns:
+        raise ValueError("Dataframe must contain 'text' column.")
+    if "label" not in df.columns:
+        if "sentiment" in df.columns:
+            df.rename(columns={"sentiment": "label"}, inplace=True)
+            print("Renamed 'sentiment' column to 'label'.")
+        else:
+            raise ValueError("Dataframe must contain 'label' or 'sentiment' column.")
+    df["label"] = "L" + df["label"].astype(str)
+
+    print(df.head())
+
+    is_test=True
+    if is_test:
+        # split the dataframe into train and test sets randomly
+        # train = df.sample(frac=0.8, random_state=42)  # 80% for training
+        # test = df.drop(train.index)  # remaining 20% for testing
+        test = df.copy()
+        train = pd.DataFrame(columns=df.columns)
+    else:
+        train = df.copy()
+        test = pd.DataFrame(columns=df.columns)
+
+    return train, test
+
+def get_prompt(config: dict, **kwargs) -> ChatPromptTemplate:
+    """
+    Get the prompt for the given task and prompt type.
+    Also returns the schema for the task if the model supports structured output.
+    :param config: configuration
+    :param kwargs: keyword arguments
+    :return: prompt
+    """
+    # Get kwargs
+    prompt_type = config["prompt_type"]
+    seed = config["seed"]
+    shots = config["shots"]
+
+    system_prompt = PROMPTS["system"]
+    user_prompt = PROMPTS["user"]
+
+    messages = [("system", system_prompt), ("human", user_prompt)]
+
+    # Add few-shot examples to the prompt
+    if "few_shot" in prompt_type:
+        few_shot_prompt = _get_few_shot_prompt(shots=shots, seed=seed)
+        # Add in position 1 (after the system prompt)
+        messages.insert(1, few_shot_prompt)
+    prompt = ChatPromptTemplate.from_messages(messages)
+    print(f'Created prompt {prompt}, shots: {shots}, seed: {seed}')
+    return prompt
+
+
+# TODO: change to your task user inputs processing function
+def get_user_inputs(data: pd.DataFrame) -> list[dict]:
+    """
+    Get user inputs for the given task.
+    :param data: data
+    :return: user inputs as a list of dictionaries
+    """
+    user_inputs = [
+        {"verse": row["text"]}
+        for _, row in data.iterrows()
+    ]
+    return user_inputs
+
+# TODO: change to your task responses processing function
+process_responses = process_responses_classification
+
+###############################################################################
+
+###############################################################################
+# Export
+# TODO: change to your task name
+METER_CLASSIFICATION_UTILS = {
+    "get_data": get_data,
+    "get_prompt": get_prompt,
+    "get_user_inputs": get_user_inputs,
+    "label2id": LABEL2ID,
+    "process_responses": process_responses,
+    "columns_to_log": LOG_COLUMNS,
+}
